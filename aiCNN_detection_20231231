@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+#
+# This is an bottle detection system for use by the Clorox sponsored project at KSU,
+# nicknamed Blipper (Bottle Flipper). Output GPIO signals are sent from the 
+# Jetson Nano to the PLC controlling the robotic arm. 
+# Object detection code by NVIDIA, edited and expanded for this project by
+# Preston Delaware. April 15, 2021
+
+
+
+#https://github.com/dusty-nv/jetson-inference/issues/1003
+
+import jetson.inference
+import jetson.utils
+import rospy
+#from geometry_msgs.msg import Twist
+from std_msgs.msg import String, UInt8
+
+
+from cv_bridge import CvBridge
+
+import numpy, os
+import time
+import cv2
+
+
+
+BURGER_MAX_LIN_VEL = 0.22
+BURGER_MAX_ANG_VEL = 2.84
+
+LIN_VEL_STEP_SIZE = 0.01
+ANG_VEL_STEP_SIZE = 0.1
+
+status = 0
+target_linear_vel   = 0.0
+target_angular_vel  = 0.0
+control_linear_vel  = 0.0
+control_angular_vel = 0.0
+value = ''
+turtlebot3_model = "burger"
+count = 0
+cut = 0
+h = 0
+s = 0
+maskr = 0
+maskg = 0
+checker = 0
+traffic_value = 0
+mission = "level"
+direction = "None"
+obstacle = ""
+red_point = 0
+green_point = 0
+video_checker = 0
+point_left_sum = 0
+point_right_sum = 0
+count_level=0
+count_open=0
+count_close=0
+is_intersection_passed = "not_passed"
+
+def obstacle_checker(data):
+	global obstacle
+	obstacle = data.data
+
+def mission_log(data):
+	global mission
+	mission = data.data
+
+
+def mission_checker(data):
+	global mission_checker
+	mission_checker = data.data
+
+def intersection_checker(data):
+	global is_intersection_passed
+	is_intersection_passed = data.data
+
+def calculate_red_pixel_ratio(frame):
+    # 프레임의 높이와 너비를 가져옴
+    height, width, _ = frame.shape
+    
+    # 빨간색 범위 (BGR 형식) 정의
+    lower_red = numpy.array([0, 75, 99])
+    upper_red = numpy.array([255, 255, 255])
+
+
+    hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    # 프레임 내에서 빨간색 픽셀을 검출
+    red_mask = cv2.inRange(hsv_frame, lower_red, upper_red)
+
+    # 빨간색 픽셀 수 계산
+    red_pixel_count = cv2.countNonZero(red_mask)
+    
+    # 빨간색 픽셀 비율 계산
+    red_pixel_ratio = red_pixel_count / (height * width)
+    
+    return red_pixel_ratio, red_mask
+	
+cvBridge = CvBridge()
+
+# load the object detection model
+net = jetson.inference.detectNet(argv=['--model=/home/jetson2g/catkin_ws/src/ros_deep_learning/src/traffic/ssd-mobilenet.onnx', '--labels=/home/jetson2g/catkin_ws/src/ros_deep_learning/src/traffic/labels.txt', '--input-blob=input_0', '--output-cvg=scores', '--output-bbox=boxes'])  #, '--threshold=0.8'
+
+
+
+# set up camera
+camera = jetson.utils.videoSource("/dev/video0")      # '/dev/video0' or 'csi://0'
+
+# set up display for output to screen
+display = jetson.utils.videoOutput("display://0")
+
+rospy.init_node('porsche')
+
+rospy.Subscriber('/mission', String, mission_log)		# 미션 받기
+rospy.Subscriber('/mission_checker', String, mission_checker)	# 미션 진행가능 여부 받기
+rospy.Subscriber('/obstacle_checker', String, obstacle_checker)
+rospy.Subscriber('/intersection_checker', String, intersection_checker)
+
+# 표지판 인식 결과 보내기
+pub_decided_mission = rospy.Publisher('/ros_deep_learning/mode', String, queue_size=10)
+pub_mission_state = rospy.Publisher('/mission_state', String, queue_size=10)
+
+
+while True: #display.IsStreaming():		# while display window is open
+	######        
+	img = camera.Capture()		# take incoming video frame
+	rgb_img = img
+	bgr_img = jetson.utils.cudaAllocMapped(width=rgb_img.width,height=rgb_img.height,format='bgr8')
+	jetson.utils.cudaConvertColor(rgb_img, bgr_img)
+	jetson.utils.cudaDeviceSynchronize()
+	cv_img = jetson.utils.cudaToNumpy(bgr_img)
+	if video_checker == 0:
+		cv_image = cv2.resize(cv_img, (320,190))
+		red_ratio, red_mask = calculate_red_pixel_ratio(cv_image)
+		roi = red_mask[100:200, 0:320]
+		cv2.imshow("CV_Output2", roi)
+		#rospy.loginfo(red_ratio)
+		#cv2.imshow("CV_Output", red_mask)
+		
+	if cv2.waitKey(1) & 0xFF == ord('q'):
+		pass
+	
+	detection = net.Detect(img)	# detect objects in the frame and save to detection variable
+	height, width, depth = img.shape
+	for detections in detection:
+		#twist=Twist()
+		#rospy.loginfo(detections)
+
+		if mission == "traffic_light":
+
+			rospy.loginfo("START TRAFFIC_LIGHT MISSION")
+			rospy.loginfo("now finding greenlight")
+			while(1):
+				pub_decided_mission.publish("traffic_light")
+				pub_mission_state.publish("finding_greenlight")
+				img = camera.Capture()
+				rgb_img = img
+				bgr_img = jetson.utils.cudaAllocMapped(width=rgb_img.width,height=rgb_img.height,format='bgr8')
+				jetson.utils.cudaConvertColor(rgb_img, bgr_img)
+				jetson.utils.cudaDeviceSynchronize()
+				cv_img = jetson.utils.cudaToNumpy(bgr_img)
+				#font = cv2.FONT_HERSHEY_SIMPLEX
+				cv_image = cv2.resize(cv_img, (320,240))
+
+				cv_image_2 = cv_image.copy()
+				cv_image_2[0:240, 100:220] = (0,0,0)
+
+				src_hsv = cv2.cvtColor(cv_image_2, cv2.COLOR_BGR2HSV)
+				cv2.line(cv_image, (100,0), (100,240), (255,100,100), 5)
+				cv2.line(cv_image, (220,0), (220,240), (255,100,100), 5)
+
+				#array = numpy.full(src_hsv.shape, (0,0,100), dtype=numpy.uint8)
+				#src_hsv = cv2.add(src_hsv, array)
+
+				dst_green = cv2.inRange(src_hsv, (40,200,200), (70,255,255))
+				dst_red = cv2.inRange(src_hsv, (0,200,250), (5,255,255))		#(0,200,250), (20,255,255)
+				kernel = numpy.ones((6,6), numpy.float32)/36
+				dilation_green = cv2.dilate(dst_green, kernel, iterations=2)
+				dilation_red = cv2.dilate(dst_red, kernel, iterations=2)
+
+				if numpy.count_nonzero(dilation_green) > 300:
+					green_point += 1
+					if green_point == 2:
+						green_point = 0
+						rospy.loginfo("Detected Green")
+						break
+
+				if numpy.count_nonzero(dilation_red) > 200:
+					red_point += 1
+					if red_point == 2:
+						red_point = 0
+						rospy.loginfo("Detected Red")
+
+				cv2.imshow('src', cv_image)
+				cv2.imshow('green', dilation_green)
+				cv2.imshow('red', dilation_red)
+				
+				if cv2.waitKey(1) and 0xFF == ord('q'):
+					break
+			video_checker = 1
+			cv2.destroyAllWindows()
+			rospy.loginfo("found greenlight")
+			rospy.loginfo("FINISHED TRAFFIC_LIGHT MISSION")
+			pub_mission_state.publish("traffic_light_END")
+			mission = "None"
+
+		
+		elif detection[0].ClassID == 2 and mission == "intersection":
+			count = count + 1
+			if count == 10:
+				rospy.loginfo("START INTERSECTION MISSION")
+				pub_decided_mission.publish("intersection")
+				pub_mission_state.publish("finding_direction")
+				rospy.loginfo("Now_Finding_Direction")
+				cv2.destroyAllWindows()
+				while(1):
+					# 좌우 표지판 검출
+					img = camera.Capture()
+					rgb_img = img
+					bgr_img = jetson.utils.cudaAllocMapped(width=rgb_img.width,height=rgb_img.height,format='bgr8')
+					jetson.utils.cudaConvertColor(rgb_img, bgr_img)
+					jetson.utils.cudaDeviceSynchronize()
+					cv_img = jetson.utils.cudaToNumpy(bgr_img)
+					cv_image = cv2.resize(cv_img, (320,190))
+					src_hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
+					dst = cv2.inRange(src_hsv, (0,0,0), (255,100,255))
+					kernel = numpy.ones((3,3), numpy.float32) / 9
+					dilation = cv2.dilate(dst, kernel, iterations=2)
+					gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
+					circles = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, 1, 100, param1=55, param2=60, minRadius=10, maxRadius=300)
+
+					try:
+						for i in circles[0]:
+							cv2.circle(cv_image, (int(i[0]),int(i[1])), int(i[2]), (0,255,255), 3)
+							x = int(i[0]); y = int(i[1]); rad = int(int(i[2]) / 2.4)
+							cv2.rectangle(cv_image, (x-rad-5,y+rad-5,10,10), (0,0,150), 2)
+							cv2.rectangle(cv_image, (x+rad-5,y+rad-5,10,10), (0,0,255), 2)
+							for i in range(-2,3):
+								for j in range(-2,3):
+									if dilation[y+rad+i,x-rad+j] == 255 and dilation[y+rad+i,x+rad+j] == 0:
+										point_left_sum += 1
+									elif dilation[y+rad+i,x-rad+j] == 0 and dilation[y+rad+i,x+rad+j] == 255:
+										point_right_sum += 1
+									elif dilation[y+rad+i,x-rad+j] == 255 and dilation[y+rad+i,x+rad+j] == 255:
+										point_left_sum += 1; point_right_sum += 1
+									else: pass
+							if point_left_sum > point_right_sum:
+								rospy.loginfo("RIGHT detected")
+								rospy.loginfo(rad)	#1차:11 2차:10 3차:10 4차:10
+								direction = "right"
+							elif point_left_sum < point_right_sum:
+								rospy.loginfo("LEFT detected")
+								rospy.loginfo(rad)	
+								direction = "left"
+							elif point_left_sum == point_right_sum:
+								rospy.loginfo("error")
+							else:
+								rospy.loginfo("None")
+							point_left_sum = 0; point_right_sum = 0
+					except: pass
+
+					cv2.imshow('src', cv_image)
+					cv2.imshow('dil', dilation)
+
+					if cv2.waitKey(1) and 0xFF == ord('q'):
+						break
+					if direction != "None":
+						cv2.destroyAllWindows()
+						pub_mission_state.publish(direction)
+						count = 0
+						break
+
+				pub_mission_state.publish(direction)
+				while(is_intersection_passed == "not_passed"):
+					rospy.loginfo("waiting until passed")
+				mission = "None"
+				rospy.loginfo("now passed intersection")
+				rospy.loginfo("FINISHED INTERSECTION MISSION")
+				
+		
+		elif detection[0].ClassID == 4 and mission == 'construction':
+			count = count + 1
+			if count == 10:
+				rospy.loginfo("START CONSTRUCTION MISSION")
+				pub_decided_mission.publish("construction")
+				pub_mission_state.publish("finding_object")
+				rospy.loginfo("Now_Find_object")
+
+				while(1):
+					rospy.loginfo("now finding obstacle")
+					if obstacle == "detected":
+						break	
+
+				rospy.loginfo("FINISHED CONSTRUCTION MISSION")
+				pub_mission_state.publish("construction_END")
+				obstacle = "None"
+				mission = "None"			
+
+					
+		elif detection[0].ClassID == 3 and mission == 'parking':
+			count = count + 1
+			if count == 10:
+				rospy.loginfo("START PARKING MISSION") 
+				pub_decided_mission.publish("parking")
+				pub_mission_state.publish("finding_dummyCar")
+				rospy.loginfo("Now_Find_DUMMYCAR")
+
+				while(1):
+					rospy.loginfo("now finding dummyCar")
+					if obstacle == "detected":
+						break	
+
+				rospy.loginfo("FINISHED PARKING MISSION")
+				pub_mission_state.publish("parking_END")
+				obstacle = "None"
+				mission = "None"
+	
+		elif detection[0].ClassID == 4 and mission == 'level':
+			count = count + 1
+			if count == 10:
+				rospy.loginfo("START LEVEL_CROSSING MISSION")
+				pub_decided_mission.publish("level_crossing")
+			# 좌우 표지판 검출
+				while(1):
+					img = camera.Capture()
+					rgb_img = img
+					bgr_img = jetson.utils.cudaAllocMapped(width=rgb_img.width,height=rgb_img.height,format='bgr8')
+					jetson.utils.cudaConvertColor(rgb_img, bgr_img)
+					jetson.utils.cudaDeviceSynchronize()
+					cv_img = jetson.utils.cudaToNumpy(bgr_img)
+					cv_image = cv2.resize(cv_img, (320,190))
+					roi = cv_image[100:200, 0:320]
+					#cv2.imshow("CV_Output", red_mask)
+					frame = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+					red_ratio, red_mask = calculate_red_pixel_ratio(roi)
+		
+					
+    
+					rospy.loginfo(red_ratio)
+					
+					if red_ratio > 0.45:
+						count_open = count_open + 1
+						if count_open > 4:
+							pub_mission_state.publish("watching_level")
+							rospy.loginfo("Now_watching_level")
+							count_level=1
+					if red_ratio < 0.45 and count_level == 1:
+						count_close = count_close + 1
+						if count_close > 10:						
+							rospy.loginfo("level_END")						
+							break						
+									
+				
+
+				rospy.loginfo("FINISHED LEVEL_CROSSING MISSION")
+				pub_mission_state.publish("level_END")
+				obstacle = "None"
+				mission = "None"
+	'''
+		elif detection[0].ClassID == 5 and value == 'tunnel':
+			count = count + 1
+			if count == 10:
+				rospy.loginfo("TUNNEL_SIGN_detected")
+				mode = String()
+				mode = "tunnel"
+				pub_decided_mode.publish(mode)
+				value == "None"
+            	
+		#else : pass
+	'''
+	if (value == '\x03'):
+			break		

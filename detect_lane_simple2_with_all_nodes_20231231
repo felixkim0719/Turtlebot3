@@ -1,0 +1,507 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# author:KeumMingi, stared from 2/14, final modified at 5/28 #
+
+import rospy, cv2, numpy
+from turtlebot3_msgs.msg import SensorState
+from cv_bridge import CvBridge, CvBridgeError
+from std_msgs.msg import UInt8, Float64, String
+from sensor_msgs.msg import Image, CompressedImage, LaserScan
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+import tf
+import math
+import os
+from enum import Enum
+import time
+
+#cap = cv2.VideoCapture(0)	#videocpap
+
+class Follower:
+
+	#'''생성자&초기화'''
+	def __init__ (self):
+		
+		#'''subscriber'''
+		self.sub_odom = rospy.Subscriber('/odom', Odometry, self.getodom, queue_size=1)
+		# 라이다 데이터 받기
+		self.sub_scan_obstacle = rospy.Subscriber('/scan', LaserScan, self.cbScanObstacle, queue_size=1)
+		# usb 카메라 받기
+		self.sub_image_original= rospy.Subscriber('/usb_cam/image_raw', Image, self.cbFindLane, queue_size = 1)
+		# 딥러닝 프로그램에서 감지 결과 받기
+		self.sub_mission = rospy.Subscriber('/ros_deep_learning/mode', String, self.sign_detect, queue_size = 10)
+		# 소나(초음파센서) 값 받기
+		#self.sub_sonar = rospy.Subscriber('sensor_state', SensorState, self.get_sonar, queue_size = 1)
+		# 터널 데이터 받기
+		#self.sub_tunnel = rospy.Subscriber('/tunnel/node', String, self.tunnel, queue_size = 10)
+
+		self.sub_mode = rospy.Subscriber('/mission_state', String, self.mission_state)
+		#'''publisher'''
+		# 차선 데이터 보내기
+		#self.pub_image_lane = rospy.Publisher('/detect/image_output/compressed', CompressedImage, queue_size = 1)
+		# 미션 진행 상황 보내기
+		self.pub_mission = rospy.Publisher('/mission', String, queue_size = 10)
+		self.pub_mission_checker = rospy.Publisher('/mission_checker', String, queue_size = 10)
+		self.pub_obstacle = rospy.Publisher('/obstacle_checker', String, queue_size = 10)
+		self.pub_intersection_checker = rospy.Publisher('/intersection_checker', String, queue_size = 10)
+		# 차선 데이터 보내기
+		#self.pub_lane = rospy.Publisher('/detect/lane', Float64, queue_size = 1)
+		# velocity(속도) 값 보내기		
+		self.pub_cmd_vel = rospy.Publisher('/cmd_vel', Twist, queue_size = 1)
+		# 터널 관련 ?
+		#self.pub_tunnel_mission = rospy.Publisher('/detect/tunnel', String, queue_size = 10)
+		
+		#'''robot basic setting'''
+		self.cvBridge = CvBridge()	# Follow 클래스 내에서 cvBridge는 CvBridge() 상속 변수
+		#self.counter = 1		# 경기 진행 상황 카운트용 변수
+		#self.lastError = 0.0		# 에러...?
+		#self.MAX_VEL = 0.12		# 최대 속도 설정...?
+		
+		#'''mission basic setting'''
+		self.lane = 1
+		self.speed = 0.4				# (차선 주행)로봇 속도 결정
+		self.curve = 0					# (차선 주행)차선 곡률 저장 변수
+		self.curve_value = 0				# (차선 주행)subscribe에 사용하는 곡률 저장 변수
+		self.now_mission_state = "None"			# 현재 미션 내의 세부단계 임시저장용 변수
+		self.now_mission = "None"			# 현재 미션 임시저장용 변수
+		self.mission_checker = [False, False, False, False, True, False]	# 미션 진행 상황 기록용 리스트
+		self.start_checker = 1				# 신호등을 보면 1로 바뀜. 출발 여부 확인해주는 용도
+		self.is_intersection_right = False		# 교차로 인식 결과에 따라 움직일 양상을 결정하기 위한 변수
+		self.intersection_end = False			# 교차로 곡선 완전 통과했는지 확인하기 위한 변수
+		self.counter = 0
+		self.distance_MAX = 0
+		self.distance = ""
+		self.odom = Odometry()
+		self.first_odom_x = self.odom.pose.pose.position.x
+		self.first_odom_y = self.odom.pose.pose.position.y
+		self.odom_checker = 2
+		self.odom_cal_x = 0
+		self.odom_cal_y = 0
+		self.first_straight_checker = 1
+		self.turning_length = 1.1
+
+	def getodom(self, odom):
+		self.odom = odom
+
+	#'''ros_deep_learning에서 표지판 인식 결과 받아오는 메서드'''
+	def sign_detect(self, data):
+		# data는 aiCNN에서 탐지한 결과를 문자열 형식으로 받은 것임.
+		# 현재 표지판 인식 결과를 토대로 새로운 미션 상황을 설정하는 역할
+		received_value = data.data
+		if received_value == "traffic_light":		# 받은 표지판(여기서 표지판 초기값은 traffic_light로 하였기에 시작 시 이 부분은 자동진입됨)
+			self.now_mission = "traffic_light"	# 현재 미션 traffic_light로 설정
+			self.mission_checker[0] = True		# 미션 진도 0번 인덱스를 True로 = 미션 진입 확인 여부를 위한 것임
+
+		elif received_value == "intersection":		# 신호등 후, 좌/우 표지판 중 하나라도 인식 시 intersection 감지로 판단
+			self.now_mission = "intersection"	# 현재 미션 traffic_light로 설정	
+			self.mission_checker[1] = True		# 미션 진도 1번 인덱스를 True로 바꿈
+
+		elif received_value == "construction":		# 공사장 표시판 인식 시 construction 감지로 판단
+			self.now_mission = "construction"	# 현재 미션 construction으로 설정
+			self.mission_checker[2] = True		# 미션 진도 2번 인덱스를 True로 바꿈
+
+		elif received_value == "parking":		# 주차 표지판 인식 시 parking 감지로 판단
+			self.now_mission = "parking"		# 현재 미션 parking으로 설정
+			self.mission_checker[3] = True		# 미션 진도 3번 인덱스를 True로 바꿈
+
+		elif received_value == "level_crossing":	# 정지 표지판 인식 시 level_crossin 감지로 판단
+			self.now_mission = "level_crossing"	# 현재 미션 level_crossing으로 설정
+			self.mission_checker[4] = True		# 미션진도 4번 인덱스를 True로 바꿈
+
+		elif received_value == "tunnel":		# 터널 표지판 인식 시 tunnel 감지로 판단
+			self.now_mission = "tunnel"		# 현재 미션 tunnel로 바꿈
+			self.mission_checker[5] = True		# 미션 진도 5번 인덱스를 True로 바꿈
+
+		else :
+			self.now_mission = "None"
+			self.now_mission_state = "None"
+
+
+	def mission_state(self, data):
+		mission_state = data.data
+		
+		if self.now_mission == "traffic_light" and mission_state == "finding_greenlight":
+			self.now_mission_state = "finding_greenlight"
+			rospy.loginfo("now_mission = traffic_light || finding_greenlight")
+
+		elif self.now_mission == "traffic_light" and mission_state == "traffic_light_END":
+			self.now_mission_state = "traffic_light_END"
+			rospy.loginfo("now_mission = traffic_light || traffic_light_END")
+
+		elif self.now_mission == "intersection" and mission_state == "finding_direction":
+			self.now_mission_state = "finding_direction"
+			rospy.loginfo("now_mission = intersection || finding_direction")
+
+		elif self.now_mission == "intersection" and mission_state == "left":
+			self.now_mission_state = "found_left"
+			rospy.loginfo("now_mission = intersection || found_left")
+
+		elif self.now_mission == "intersection" and mission_state == "right":
+			self.now_mission_state = "found_right"
+			rospy.loginfo("now_mission = intersection || found_right")
+
+		elif self.now_mission == "construction" and mission_state == "finding_object":
+			self.now_mission_state = "finding_object"
+			rospy.loginfo("now_mission = construction || finding_object")
+
+		elif self.now_mission == "construction" and mission_state == "construction_END":
+			self.now_mission_state = "construction_END"
+			rospy.loginfo("now_mission = construction || construction_END")
+
+		elif self.now_mission == "parking" and mission_state == "finding_dummyCar":
+			self.now_mission_state = "finding_dummyCar"
+			rospy.loginfo("now_mission = parking || finding_dummyCar")
+
+		elif self.now_mission == "parking" and mission_state == "parking_END":
+			self.now_mission_state = "parking_END"
+			rospy.loginfo("now_mission = parking || parking_END")
+
+		elif self.now_mission == "level_crossing" and mission_state == "watching_level":
+			self.now_mission_state = "watching_level"
+			rospy.loginfo("now_mission = level || watching_level")
+
+		elif self.now_mission == "level_crossing" and mission_state == "level_END":
+			self.now_mission_state = "level_END"
+			rospy.loginfo("now_mission = level || level_END")
+
+
+	def cbScanObstacle(self, scan):
+		'''
+		if self.now_mission == "intersection" and self.now_mission_state == "found_right":
+			distance=[0]*240
+
+			for i in range(240):
+				if i<60:
+					distance[i] = int(scan.ranges[300 + i]*100)
+				elif i>=60:
+					distance[i] = int(scan.ranges[i - 60]*100)
+				if distance[i] == 0 or distance[i] > 100:
+					distance[i] = 100
+		
+			self.distance = min(distance)
+			#if distance[90] < 30: self.distance_MAX = 1000	# 종료키워드값=1000
+			if self.distance_MAX == 0: self.distance_MAX = self.distance
+		'''
+		#)
+		if self.now_mission == "construction" and self.mission_checker[2] == True:
+			if scan.ranges[30] == 0: pass
+			else:
+				distance30 = int(scan.ranges[30] * 100)
+				rospy.loginfo(distance30)
+				if distance30 < 50: self.distance = "detected" ; rospy.loginfo("watched")
+				else : self.distance = ""
+		elif self.now_mission == "parking" and self.mission_checker[3] == True:
+			if scan.ranges[30] == 0: pass
+			else:
+				distance30 = int(scan.ranges[30] * 100)
+				rospy.loginfo(distance30)
+				if distance30 < 50: self.distance = "detected" ; rospy.loginfo("watched")
+				else : self.distance = ""
+
+
+	#'''차선 찾기 및 그에 관련된 모든 일에 관여하는 메서드'''
+	def cbFindLane(self, image_msg):	# 영상 받기(ROS의 영상 Message)
+		if self.start_checker == 1:
+			twist = Twist()			# 바퀴 구동(로봇 움직임)을 위한 Twist() 라이브러리 상속
+			cv_image = self.cvBridge.imgmsg_to_cv2(image_msg, "bgr8")	# (ROS의 영상 Message를 OpenCV 이미지 형태로 변환)
+			if self.first_straight_checker == 0:
+				self.first_straight_checker = 1
+				for i in range(100):
+					rospy.loginfo("start")
+					twist.linear.x = 0.16
+					twist.angular.z = 0
+					self.pub_cmd_vel.publish(twist)
+
+			hsv= cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)	# BGR 이미지를 HSV 이미지로 변환
+			lower_yellow= numpy.array([0, 80, 170]) # 0, 40, 170	# 노란 차선 인식 최저 기준
+			upper_yellow= numpy.array([30, 255, 250]) # 179, 255, 255 # 노란 차선 인식 최고 기준
+			mask= cv2.inRange(hsv, lower_yellow, upper_yellow) # 위 두 범위 내의 HSV 색상 = 255, 나머지 = 0 변환
+			h, w, d = cv_image.shape# h = 영상 높이, w = 영상 너비, d = 영상 채널(컬러 = 3, 흑백 = 1)
+			search_top= 3*h/4		# 인식 최저 부분 선택
+			search_bot= 3*h/4 + 20 		# 인식 최고 부분 선택
+			mask[0:search_top, 0:w] = 0	# 인식 영역(관심영역) 제외한 나머지는 0
+			mask[search_bot:h, 0:w] = 0
+			M = cv2.moments(mask)		# 처리가 끝난 mask에서 중심을 moments()로 찾음
+
+
+			#rospy.loginfo(int(M['m00']))
+			if M['m00'] > 0 and self.lane != 0:	# 차선을 인식하고 있다면
+				cx = int(M['m10']/M['m00'])	# 중심점의 x좌표 구하기
+				cy = int(M['m01']/M['m00'])	# 중심점의 y좌표 구하기
+				#rospy.loginfo("moments x:%d y:%d"%(cx,cy))
+
+				err = cx - w/3			# w/2 는 화면의 중앙, -> w/3 좌측 1/3 지점
+				self.curve = -float(err) / 100  # 화면 너비의 1/3 지점에서 벗어난 값에 비례해 curve(곡률) 설정
+				#rospy.loginfo(self.curve)
+				########################rospy.loginfo("curve = %f"%(0.5-self.curve))
+	
+				# curve 조건에 따른 모터 구동 방식 결정
+				if self.curve >= 0.45 and self.curve <=0.55:    # -0.1      0.5
+					self.speed = 0.4
+					self.curve_value = 0
+	
+				elif (self.curve >= -1.1 and self.curve < 0.45) or (self.curve > 0.55 and self.curve <=1.1):
+					self.speed = 0.4
+					self.curve_value= -(0.5 - self.curve)*3.5
+	
+				else:
+					self.speed = -0.04    #0.04
+					self.curve_value = (self.curve+0.15)/1.2
+				
+				# 모터 구동 변수 publish
+				twist.linear.x = self.speed		# 기본 직진값 = 0.4, 위의 조건에 따라 달라질 수 있음
+				twist.angular.z = self.curve_value	# 로봇의 각속도, 위의 조건에 따라 결정됨
+				self.pub_cmd_vel.publish(twist)		# 위의 twist 값들을 publish
+	
+			elif self.lane == 0:	# 차선 인식이 안되었다면
+				pass		# pass
+
+			else:						# 나머지 경우
+				twist.linear.x = self.speed		# 직진 속도
+				twist.angular.z = self.curve_value	# 각속도	
+				self.pub_cmd_vel.publish(twist)		# 위의 twist 값들을 publish
+	
+			if self.odom_checker == 1:	# odometry계산, 인식 위치와 현재 위치 비교
+				#rospy.loginfo("##########check##########")
+				self.odom_cal_x = abs(self.odom.pose.pose.position.x - self.first_odom_x)
+				self.odom_cal_y = abs(self.odom.pose.pose.position.y - self.first_odom_y)
+				rospy.loginfo("cal_x:%f, cal_y:%f"%(self.odom_cal_x, self.odom_cal_y))
+				if self.odom_cal_y < 0.3 and self.odom_cal_x > 0.4:		#0.25
+					rospy.loginfo("now start turn")
+					"""
+					while(1):
+						rospy.loginfo("!!!!")
+						twist.linear.x = 0
+						twist.angular.z = 0
+						self.pub_cmd_vel.publish(twist)
+					
+					for i in range(70):
+						rospy.loginfo("now moving1")
+						twist.linear.x = 0.13
+						twist.angular.z = 0
+						self.pub_cmd_vel.publish(twist)
+
+					for i in range(190):
+						rospy.loginfo("now moving2")
+						twist.linear.x = 0
+						twist.angular.z = -0.55
+						self.pub_cmd_vel.publish(twist)
+
+					for i in range(50):
+						rospy.loginfo("now moving3")
+						twist.linear.x = 0.13
+						twist.angular.z = 0
+						self.pub_cmd_vel.publish(twist)
+					"""
+					for i in range(300):	#300
+						rospy.loginfo("moving to final spot")
+						twist.linear.x = 0.12
+						twist.angular.z = -0.55
+						self.pub_cmd_vel.publish(twist)
+					rospy.loginfo("turn finished")
+					self.odom_checker = 2
+
+			elif self.odom_checker == 0:	# odometry계산, 인식 위치와 현재 위치 비교
+				rospy.loginfo("x:%f, y:%f"%(self.odom.pose.pose.position.x, self.odom.pose.pose.position.y))
+				
+				if abs(self.odom.pose.pose.position.x) > 1.31  and abs(self.odom.pose.pose.position.x) < 1.34 : self.turning_length = 1.15
+				elif abs(self.odom.pose.pose.position.x) >= 1.34 : self.turning_length = 1.20
+				
+				#turning_length = 1.20
+				if abs(self.odom.pose.pose.position.x) > 1.00 and abs(self.odom.pose.pose.position.x) < self.turning_length and abs(self.odom.pose.pose.position.y) > 0.5 :
+					for i in range(5):
+						rospy.loginfo("now in front of intersections")
+						twist.linear.x = 0
+						twist.angular.z = 0
+						self.pub_cmd_vel.publish(twist)
+					self.pub_intersection_checker.publish("start")
+
+		#___________________________________주행 중 미션 처리___________________________________#
+
+		if self.mission_checker[0] == True and self.now_mission == "traffic_light":
+			rospy.loginfo("START TRAFFIC_LIGHT MISSION")
+			rospy.loginfo("now finding greenlight")
+			# 멈추기 #
+			while(self.now_mission_state != "traffic_light_END"): pass
+			#if self.now_mission_state == "traffic_light_END":
+			self.now_mission = "intersection"
+			self.pub_mission.publish("intersection")
+			rospy.loginfo("FINISHED TRAFFIC_LIGHT MISSION")
+			self.mission_checker[0] = False
+			self.start_checker = 1
+
+		
+		elif self.mission_checker[1] == True and self.now_mission == "intersection":
+			if self.is_intersection_right == False:
+				rospy.loginfo("START INTERSECTION MISSION")
+				rospy.loginfo("now finding direction")
+				while(self.now_mission_state == "finding_direction"):
+					twist.linear.x = 0	# 기본 직진값 = 0.4, 위의 조건에 따라 달라질 수 있음
+					twist.linear.y = 0		
+					twist.linear.z = 0
+					twist.angular.x = 0
+					twist.angular.y = 0
+					twist.angular.z = 0
+					rospy.loginfo("checking")
+					self.pub_cmd_vel.publish(twist)
+				rospy.loginfo("state is '%s'"%self.now_mission_state)
+				
+				if self.now_mission_state == "found_right":
+					print(self.odom.pose.pose.position.x)
+					print(self.odom.pose.pose.position.y)
+					self.first_odom_x = self.odom.pose.pose.position.x
+					self.first_odom_y = self.odom.pose.pose.position.y
+					for i in range(130):
+						rospy.loginfo("moving to right")
+						twist.linear.x = 0.12	#13
+						twist.angular.z = -0.55
+						self.pub_cmd_vel.publish(twist)
+
+					rospy.loginfo("finished moving")
+					self.is_intersection_right = True	# 교차로 오른쪽 감지는 True
+					self.intersection_end = True
+					self.odom_checker = 1
+				
+
+				elif self.now_mission_state == "found_left":
+					rospy.loginfo("go to left")
+					for i in range(180):
+						rospy.loginfo("moving to left")
+						twist.linear.x = 0.12	#13
+						twist.angular.z = 0.55
+						self.pub_cmd_vel.publish(twist)
+					self.is_intersection_right = False	# 교차로 왼쪽 감지는 False
+					self.intersection_end = True
+					self.odom_checker = 2
+				
+				
+			
+			if self.intersection_end == True:
+				self.pub_intersection_checker.publish("now_passed")
+				self.now_mission = "construction"
+				for i in range(10):self.pub_mission.publish("construction")
+				rospy.loginfo("FINISHED INTERSECTION MISSION")
+				self.mission_checker[1] = False
+
+		
+		
+		elif self.mission_checker[2] == True and self.now_mission == "construction":
+			rospy.loginfo("START CONSTRUCTION MISSION")
+			"""
+			while True:
+				twist.linear.x = 0
+				twist.angular.z = 0
+				self.pub_cmd_vel.publish(twist)
+			"""
+			if self.distance == "detected":
+				"""
+				while True:
+					rospy.loginfo("stop")
+					twist.linear.x = 0
+					twist.angular.z = 0
+					self.pub_cmd_vel.publish(twist)
+				"""
+				for i in range(250):
+					rospy.loginfo("go to forward 1")					
+					twist.linear.x = 0.16
+					twist.angular.z = 0
+					self.pub_cmd_vel.publish(twist)				
+				for i in range(460):
+					rospy.loginfo("turn to left 2")					
+					twist.linear.x = 0.15
+					twist.angular.z = 0.55
+					self.pub_cmd_vel.publish(twist)
+				for i in range(335):
+					rospy.loginfo("turn toright 2")					
+					twist.linear.x = 0.15
+					twist.angular.z = -0.55
+					self.pub_cmd_vel.publish(twist)
+				for i in range(445):
+					rospy.loginfo("turn to left 90 2")					
+					twist.linear.x = 0.15
+					twist.angular.z = 0.55
+					self.pub_cmd_vel.publish(twist)
+				for i in range(150):
+					rospy.loginfo("go to forward 1")					
+					twist.linear.x = 0.16
+					twist.angular.z = 0
+					self.pub_cmd_vel.publish(twist)
+
+				# 일부 이동해 자리잡기 #
+				# 장애물 피하는 매서드 실행 #
+				self.pub_obstacle.publish("passed")
+			"""
+			self.now_mission = "parking"
+			self.pub_mission.publish("parking")
+			rospy.loginfo("FINISHED CONSTRUCTION MISSION")
+			self.mission_checker[2] = False
+			"""
+			
+		
+		elif self.mission_checker[3] == True and self.now_mission == "parking":
+			rospy.loginfo("START PARKING MISSION")
+			while(1):
+				twist.linear.x = 0
+				twist.angular.z = 0
+				self.pub_cmd_vel.publish(twist)
+			'''
+			if # 오른쪽 앞에 물체 감지됨 # == True:
+				# 왼쪽 편에 주차 #
+				# 3초 대기 #
+				# 빠져나가기 #
+				self.pub_obstacle.publish("detected")
+
+			elif # 왼쪽 앞에 물체 감지됨 # == True:
+				# 오른쪽 편에 주차 #
+				# 3초 대기 #
+				# 빠져나가기 #
+				self.pub_obstacle.publish("detected")
+
+			self.now_mission = "level"
+			self.pub_mission.publish("level")
+			rospy.loginfo("FINISHED PARKING MISSION")
+			self.mission_checker[3] = False
+			'''
+
+		
+		elif self.mission_checker[4] == True and self.now_mission == "level_crossing":
+			rospy.loginfo("START LEVEL_CROSSING MISSION")
+			if self.now_mission_state == "watching_level":
+				rospy.loginfo("checked")
+				while True:
+					twist.linear.x = 0	# 기본 직진값 = 0.4, 위의 조건에 따라 달라질 수 있음
+					twist.linear.y = 0		
+					twist.linear.z = 0
+					twist.angular.x = 0
+					twist.angular.y = 0
+					twist.angular.z = 0
+					rospy.loginfo("checking")
+					self.pub_cmd_vel.publish(twist)
+					if self.now_mission_state == "level_END":
+						rospy.loginfo("finished")
+						break
+			
+
+			
+		"""
+
+		elif self.mission_checker[5] == True and self.now_mission == "tunnel":
+		'''
+
+		#else : pass
+		"""
+
+	#def cbScanObstacle(self, scan):
+
+
+	#def get_sonar(self, sensor):
+	
+	def main(self):
+		# rospy.spin() : 해당 프로그램이 토픽을 받거나 시간 트리거 이벤트가 일어면 해당 이벤트의 callback 함수가 호출되도록 하는 반복 함수
+		# shutdown 시그널(ctrl + c)이 일어날때까지 무한 반복에 들어가는 특징
+		rospy.spin()
+
+if __name__ == '__main__':
+	rospy.init_node('detect_lane_simple')
+	node = Follower()
+	node.main()
