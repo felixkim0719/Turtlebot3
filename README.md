@@ -2,7 +2,7 @@
 
 ## 1. Overview
 This project implements autonomous driving using ROS and TurtleBot3. It incorporates line tracing, traffic light recognition, intersection recognition, barrier detection, and AI integration to allow the robot to navigate autonomously in various environments.
-
+![](https://raw.githubusercontent.com/felixkim0719/Turtlebot3/main/ROS.jpg)
 ## 2. Objective
 The project aims to develop a robot capable of recognizing and responding to traffic signals, lines, and barriers, enabling autonomous navigation and task execution.
 
